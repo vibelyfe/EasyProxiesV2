@@ -13,6 +13,10 @@ mode: pool
 # 日志级别: debug, info, warn, error
 log_level: info
 
+# 前置代理（可选）：代理池节点出站、订阅拉取、GeoIP 下载均可复用该前置代理
+# 支持: http:// / https:// / socks5:// / socks5h://
+# forward_proxy: "http://127.0.0.1:7890"
+
 # 全局跳过 SSL 证书验证（默认 false，不建议在生产环境启用）
 skip_cert_verify: false
 

@@ -2,6 +2,7 @@ package geoip
 
 import (
 	"bytes"
+	"easy_proxies/internal/config"
 	"fmt"
 	"io"
 	"log"
@@ -45,12 +46,14 @@ type Lookup struct {
 	mu             sync.RWMutex
 	path           string
 	updateInterval time.Duration
+	forwardProxy   string
+	skipTLSVerify  bool
 	stopChan       chan struct{}
 	updateOnce     sync.Once
 }
 
 // EnsureDatabase checks if the GeoIP database exists, and downloads it if not
-func EnsureDatabase(dbPath string) error {
+func EnsureDatabase(dbPath, forwardProxy string, skipCertVerify bool) error {
 	if dbPath == "" {
 		return nil
 	}
@@ -79,7 +82,10 @@ func EnsureDatabase(dbPath string) error {
 	}
 
 	// Download with timeout
-	client := &http.Client{Timeout: 60 * time.Second}
+	client, err := config.NewHTTPClient(60*time.Second, forwardProxy, skipCertVerify)
+	if err != nil {
+		return fmt.Errorf("create http client: %w", err)
+	}
 	req, err := http.NewRequest(http.MethodGet, DefaultGeoIPURL, nil)
 	if err != nil {
 		return fmt.Errorf("create download request: %w", err)
@@ -245,17 +251,17 @@ func downloadFile(filepath string, url string) error {
 
 // New creates a new GeoIP lookup instance
 func New(dbPath string) (*Lookup, error) {
-	return NewWithAutoUpdate(dbPath, 0)
+	return NewWithAutoUpdate(dbPath, 0, "", false)
 }
 
 // NewWithAutoUpdate creates a new GeoIP lookup instance with auto-update support
-func NewWithAutoUpdate(dbPath string, updateInterval time.Duration) (*Lookup, error) {
+func NewWithAutoUpdate(dbPath string, updateInterval time.Duration, forwardProxy string, skipCertVerify bool) (*Lookup, error) {
 	if dbPath == "" {
 		return &Lookup{}, nil
 	}
 
 	// Ensure database exists (download if needed)
-	if err := EnsureDatabase(dbPath); err != nil {
+	if err := EnsureDatabase(dbPath, forwardProxy, skipCertVerify); err != nil {
 		return nil, fmt.Errorf("ensure database: %w", err)
 	}
 
@@ -268,6 +274,8 @@ func NewWithAutoUpdate(dbPath string, updateInterval time.Duration) (*Lookup, er
 		db:             db,
 		path:           dbPath,
 		updateInterval: updateInterval,
+		forwardProxy:   forwardProxy,
+		skipTLSVerify:  skipCertVerify,
 		stopChan:       make(chan struct{}),
 	}
 
@@ -303,7 +311,7 @@ func (l *Lookup) Update() error {
 
 	// Download to temporary file
 	tempPath := l.path + ".update"
-	if err := downloadDatabase(tempPath); err != nil {
+	if err := downloadDatabase(tempPath, l.forwardProxy, l.skipTLSVerify); err != nil {
 		return fmt.Errorf("download failed: %w", err)
 	}
 	defer os.Remove(tempPath) // Clean up temp file
@@ -340,7 +348,7 @@ func (l *Lookup) Update() error {
 }
 
 // downloadDatabase downloads the GeoIP database to the specified path
-func downloadDatabase(filepath string) error {
+func downloadDatabase(filepath, forwardProxy string, skipCertVerify bool) error {
 	// Create parent directory if needed
 	dir := filepath[:strings.LastIndex(filepath, "/")]
 	if dir != "" && dir != "." {
@@ -350,7 +358,10 @@ func downloadDatabase(filepath string) error {
 	}
 
 	// Download with timeout
-	client := &http.Client{Timeout: 60 * time.Second}
+	client, err := config.NewHTTPClient(60*time.Second, forwardProxy, skipCertVerify)
+	if err != nil {
+		return fmt.Errorf("create http client: %w", err)
+	}
 	req, err := http.NewRequest(http.MethodGet, DefaultGeoIPURL, nil)
 	if err != nil {
 		return fmt.Errorf("create download request: %w", err)
