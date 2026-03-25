@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -35,6 +36,7 @@ type Config struct {
 	Subscriptions       []string                  `yaml:"subscriptions"` // 订阅链接列表
 	ExternalIP          string                    `yaml:"external_ip"`   // 外部 IP 地址，用于导出时替换 0.0.0.0
 	LogLevel            string                    `yaml:"log_level"`
+	ForwardProxy        string                    `yaml:"forward_proxy"`    // 前置代理地址，用于订阅/GeoIP 等外部请求
 	SkipCertVerify      bool                      `yaml:"skip_cert_verify"` // 全局跳过 SSL 证书验证
 	DatabasePath        string                    `yaml:"database_path"`    // SQLite 数据库路径，默认 data/data.db
 
@@ -306,6 +308,12 @@ func (c *Config) applyDefaults() error {
 	if c.LogLevel == "" {
 		c.LogLevel = "info"
 	}
+	c.ForwardProxy = strings.TrimSpace(c.ForwardProxy)
+	if c.ForwardProxy != "" {
+		if _, err := ParseForwardProxyURL(c.ForwardProxy); err != nil {
+			return fmt.Errorf("invalid forward_proxy: %w", err)
+		}
+	}
 
 	return nil
 }
@@ -349,7 +357,7 @@ func (c *Config) normalizeInternal(skipSubscriptionFetch bool) error {
 			var subNodes []NodeConfig
 			subTimeout := c.SubscriptionRefresh.Timeout
 			for _, subURL := range c.Subscriptions {
-				nodes, err := loadNodesFromSubscription(subURL, subTimeout)
+				nodes, err := loadNodesFromSubscription(subURL, subTimeout, c.ForwardProxy, c.SkipCertVerify)
 				if err != nil {
 					log.Printf("⚠️ Failed to load subscription %q: %v (skipping)", subURL, err)
 					continue
@@ -572,12 +580,13 @@ func loadNodesFromFile(path string) ([]NodeConfig, error) {
 
 // loadNodesFromSubscription fetches and parses nodes from a subscription URL
 // Supports multiple formats: base64 encoded, plain text, clash yaml, etc.
-func loadNodesFromSubscription(subURL string, timeout time.Duration) ([]NodeConfig, error) {
+func loadNodesFromSubscription(subURL string, timeout time.Duration, forwardProxy string, skipCertVerify bool) ([]NodeConfig, error) {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	client := &http.Client{
-		Timeout: timeout,
+	client, err := NewHTTPClient(timeout, forwardProxy, skipCertVerify)
+	if err != nil {
+		return nil, fmt.Errorf("create http client: %w", err)
 	}
 
 	req, err := http.NewRequest("GET", subURL, nil)
@@ -608,6 +617,65 @@ func loadNodesFromSubscription(subURL string, timeout time.Duration) ([]NodeConf
 
 	// Try to detect and parse different formats
 	return parseSubscriptionContent(content)
+}
+
+// ParseForwardProxyURL validates and parses forward proxy URL.
+func ParseForwardProxyURL(value string) (*url.URL, error) {
+	raw := strings.TrimSpace(value)
+	if raw == "" {
+		return nil, nil
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse url: %w", err)
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https", "socks5", "socks5h":
+	default:
+		return nil, fmt.Errorf("unsupported scheme %q (only http/https/socks5/socks5h)", parsed.Scheme)
+	}
+	if parsed.Host == "" {
+		return nil, errors.New("host is required")
+	}
+	return parsed, nil
+}
+
+// NewHTTPClient creates a shared HTTP client with pooling and optional forward proxy.
+func NewHTTPClient(timeout time.Duration, forwardProxy string, skipCertVerify bool) (*http.Client, error) {
+	var proxyFunc func(*http.Request) (*url.URL, error)
+	if parsedProxy, err := ParseForwardProxyURL(forwardProxy); err != nil {
+		return nil, err
+	} else if parsedProxy != nil {
+		proxyFunc = http.ProxyURL(parsedProxy)
+	} else {
+		proxyFunc = http.ProxyFromEnvironment
+	}
+
+	transport := &http.Transport{
+		Proxy: proxyFunc,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
+	}
+	if skipCertVerify {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	return &http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+	}, nil
 }
 
 // parseSubscriptionContent tries to parse subscription content in various formats (optimized)
@@ -1043,6 +1111,7 @@ func (c *Config) SaveSettings() error {
 	saveCfg.Mode = c.Mode
 	saveCfg.LogLevel = c.LogLevel
 	saveCfg.ExternalIP = c.ExternalIP
+	saveCfg.ForwardProxy = c.ForwardProxy
 	saveCfg.SkipCertVerify = c.SkipCertVerify
 
 	// Listener

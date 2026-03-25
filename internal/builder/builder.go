@@ -29,6 +29,21 @@ func Build(cfg *config.Config) (option.Options, error) {
 	metadata := make(map[string]poolout.MemberMeta)
 	var failedNodes []string
 	usedTags := make(map[string]int) // Track tag usage for uniqueness
+	forwardProxyTag := ""
+
+	if strings.TrimSpace(cfg.ForwardProxy) != "" {
+		forwardURI, err := rewriteForwardProxyForOutbound(cfg.ForwardProxy)
+		if err != nil {
+			return option.Options{}, fmt.Errorf("invalid forward_proxy for outbound: %w", err)
+		}
+		const detourTag = "forward-proxy"
+		forwardOutbound, err := buildNodeOutbound(detourTag, forwardURI, cfg.SkipCertVerify)
+		if err != nil {
+			return option.Options{}, fmt.Errorf("build forward proxy outbound: %w", err)
+		}
+		baseOutbounds = append(baseOutbounds, forwardOutbound)
+		forwardProxyTag = detourTag
+	}
 
 	// Initialize GeoIP lookup if enabled
 	var geoLookup *geoip.Lookup
@@ -40,9 +55,9 @@ func Build(cfg *config.Config) (option.Options, error) {
 			if interval == 0 {
 				interval = 24 * time.Hour // Default to 24 hours
 			}
-			geoLookup, err = geoip.NewWithAutoUpdate(cfg.GeoIP.DatabasePath, interval)
+			geoLookup, err = geoip.NewWithAutoUpdate(cfg.GeoIP.DatabasePath, interval, cfg.ForwardProxy, cfg.SkipCertVerify)
 		} else {
-			geoLookup, err = geoip.New(cfg.GeoIP.DatabasePath)
+			geoLookup, err = geoip.NewWithAutoUpdate(cfg.GeoIP.DatabasePath, 0, cfg.ForwardProxy, cfg.SkipCertVerify)
 		}
 		if err != nil {
 			log.Printf("⚠️  GeoIP database load failed: %v (region routing disabled)", err)
@@ -77,6 +92,11 @@ func Build(cfg *config.Config) (option.Options, error) {
 			log.Printf("❌ Failed to build node '%s': %v (skipping)", node.Name, err)
 			failedNodes = append(failedNodes, node.Name)
 			continue
+		}
+		if forwardProxyTag != "" {
+			if !applyOutboundDetour(&outbound, forwardProxyTag) {
+				log.Printf("⚠️  Node '%s' does not support detour option, forward_proxy ignored for this node", node.Name)
+			}
 		}
 		memberTags = append(memberTags, tag)
 		baseOutbounds = append(baseOutbounds, outbound)
@@ -281,6 +301,43 @@ func Build(cfg *config.Config) (option.Options, error) {
 		Route:     &route,
 	}
 	return opts, nil
+}
+
+func applyOutboundDetour(outbound *option.Outbound, detourTag string) bool {
+	if outbound == nil || outbound.Options == nil || detourTag == "" {
+		return false
+	}
+	wrapper, ok := outbound.Options.(option.DialerOptionsWrapper)
+	if !ok {
+		return false
+	}
+	dialerOptions := wrapper.TakeDialerOptions()
+	dialerOptions.Detour = detourTag
+	wrapper.ReplaceDialerOptions(dialerOptions)
+	return true
+}
+
+func rewriteForwardProxyForOutbound(raw string) (string, error) {
+	parsed, err := config.ParseForwardProxyURL(raw)
+	if err != nil {
+		return "", err
+	}
+	if parsed == nil {
+		return "", errors.New("empty forward proxy")
+	}
+
+	switch strings.ToLower(parsed.Scheme) {
+	case "socks5h":
+		parsed.Scheme = "socks5"
+	case "https":
+		q := parsed.Query()
+		if q.Get("security") == "" {
+			q.Set("security", "tls")
+		}
+		parsed.RawQuery = q.Encode()
+		parsed.Scheme = "http"
+	}
+	return parsed.String(), nil
 }
 
 func buildPoolInbound(cfg *config.Config) (option.Inbound, error) {

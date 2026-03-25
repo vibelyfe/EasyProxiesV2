@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -64,27 +63,6 @@ type Manager struct {
 func New(cfg *config.Config, boxMgr *boxmgr.Manager, opts ...Option) *Manager {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Create optimized HTTP client with connection pooling
-	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   10,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		ResponseHeaderTimeout: 10 * time.Second,
-	}
-
-	httpClient := &http.Client{
-		Transport: transport,
-		Timeout:   60 * time.Second, // Overall timeout
-	}
-
 	m := &Manager{
 		baseCfg:       cfg,
 		boxMgr:        boxMgr,
@@ -92,7 +70,6 @@ func New(cfg *config.Config, boxMgr *boxmgr.Manager, opts ...Option) *Manager {
 		cancel:        cancel,
 		manualRefresh: make(chan struct{}, 1),
 		configChanged: make(chan struct{}, 1),
-		httpClient:    httpClient,
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -100,6 +77,7 @@ func New(cfg *config.Config, boxMgr *boxmgr.Manager, opts ...Option) *Manager {
 	if m.logger == nil {
 		m.logger = defaultLogger{}
 	}
+	m.rebuildHTTPClient()
 	return m
 }
 
@@ -423,7 +401,11 @@ func (m *Manager) OnConfigUpdate(cfg *config.Config) {
 		return
 	}
 	m.mu.Lock()
+	if m.httpClient != nil {
+		m.httpClient.CloseIdleConnections()
+	}
 	m.baseCfg = cfg
+	m.rebuildHTTPClientLocked()
 	m.mu.Unlock()
 	m.logger.Infof("subscription manager config updated after reload")
 
@@ -433,6 +415,21 @@ func (m *Manager) OnConfigUpdate(cfg *config.Config) {
 	case m.configChanged <- struct{}{}:
 	default:
 	}
+}
+
+func (m *Manager) rebuildHTTPClient() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rebuildHTTPClientLocked()
+}
+
+func (m *Manager) rebuildHTTPClientLocked() {
+	client, err := config.NewHTTPClient(60*time.Second, m.baseCfg.ForwardProxy, m.baseCfg.SkipCertVerify)
+	if err != nil {
+		m.logger.Warnf("invalid forward_proxy=%q, fallback to environment proxy: %v", m.baseCfg.ForwardProxy, err)
+		client, _ = config.NewHTTPClient(60*time.Second, "", m.baseCfg.SkipCertVerify)
+	}
+	m.httpClient = client
 }
 
 // CheckNodesModified always returns false — with SQLite Store,
